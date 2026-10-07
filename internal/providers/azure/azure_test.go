@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -30,8 +31,96 @@ import (
 	"github.com/coreos/ignition/v2/internal/log"
 	"github.com/coreos/ignition/v2/internal/resource"
 
+	"github.com/coreos/vcontext/report"
 	"golang.org/x/sys/unix"
 )
+
+func newIMDSTestFetcher(t *testing.T, handler http.Handler) *resource.Fetcher {
+	t.Helper()
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tests using this helper must stay serial since the endpoint is package-global.
+	originalURL := imdsUserdataURL
+	imdsUserdataURL.Scheme = serverURL.Scheme
+	imdsUserdataURL.Host = serverURL.Host
+	t.Cleanup(func() { imdsUserdataURL = originalURL })
+
+	logger := log.New(true)
+	fetcher := &resource.Fetcher{Logger: &logger}
+	totalTimeout := 5
+	if err := fetcher.UpdateHttpTimeoutsAndCAs(types.Timeouts{
+		HTTPTotal: &totalTimeout,
+	}, nil, types.Proxy{}); err != nil {
+		t.Fatal(err)
+	}
+	return fetcher
+}
+
+func TestFetchFromAzureMetadataEmptyUserData(t *testing.T) {
+	ovfError := errors.New("OVF fetch failed")
+	tests := []struct {
+		name    string
+		wantErr error
+	}{
+		{name: "returns OVF config"},
+		{name: "returns OVF error", wantErr: ovfError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests atomic.Int32
+			fetcher := newIMDSTestFetcher(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			wantConfig := types.Config{
+				Ignition: types.Ignition{Version: "3.7.0-experimental"},
+			}
+			wantReport := report.Report{
+				Entries: []report.Entry{{Kind: report.Warn, Message: "OVF report"}},
+			}
+			originalFetch := fetchFromOvfDevice
+			t.Cleanup(func() { fetchFromOvfDevice = originalFetch })
+			ovfCalls := 0
+			fetchFromOvfDevice = func(f *resource.Fetcher, fsTypes []string) (types.Config, report.Report, error) {
+				ovfCalls++
+				if requests.Load() != 1 {
+					t.Errorf("expected one IMDS request before OVF fallback, got %d", requests.Load())
+				}
+				if f != fetcher {
+					t.Error("OVF fallback received a different fetcher")
+				}
+				if !reflect.DeepEqual(fsTypes, []string{CDS_FSTYPE_UDF}) {
+					t.Errorf("expected UDF filesystem type, got %v", fsTypes)
+				}
+				return wantConfig, wantReport, tt.wantErr
+			}
+
+			gotConfig, gotReport, err := fetchFromAzureMetadata(fetcher)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("expected error %v, got %v", tt.wantErr, err)
+			}
+			if ovfCalls != 1 {
+				t.Fatalf("expected one OVF fallback call, got %d", ovfCalls)
+			}
+			if requests.Load() != 1 {
+				t.Fatalf("expected one IMDS request, got %d", requests.Load())
+			}
+			if !reflect.DeepEqual(gotConfig, wantConfig) {
+				t.Fatalf("expected OVF config %+v, got %+v", wantConfig, gotConfig)
+			}
+			if !reflect.DeepEqual(gotReport, wantReport) {
+				t.Fatalf("expected OVF report %+v, got %+v", wantReport, gotReport)
+			}
+		})
+	}
+}
 
 func TestFetchFromIMDSRetryCodes(t *testing.T) {
 	config := `{"ignition":{"version":"3.4.0"}}`
@@ -74,7 +163,7 @@ func TestFetchFromIMDSRetryCodes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var attempts atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fetcher := newIMDSTestFetcher(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != http.MethodGet {
 					t.Errorf("expected GET, got %q", r.Method)
 				}
@@ -98,28 +187,8 @@ func TestFetchFromIMDSRetryCodes(t *testing.T) {
 					t.Errorf("writing IMDS response: %v", err)
 				}
 			}))
-			t.Cleanup(server.Close)
 
-			serverURL, err := url.Parse(server.URL)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// These subtests must stay serial since the endpoint is package-global.
-			originalURL := imdsUserdataURL
-			imdsUserdataURL.Scheme = serverURL.Scheme
-			imdsUserdataURL.Host = serverURL.Host
-			t.Cleanup(func() { imdsUserdataURL = originalURL })
-
-			logger := log.New(true)
-			fetcher := resource.Fetcher{Logger: &logger}
-			totalTimeout := 5
-			if err := fetcher.UpdateHttpTimeoutsAndCAs(types.Timeouts{
-				HTTPTotal: &totalTimeout,
-			}, nil, types.Proxy{}); err != nil {
-				t.Fatal(err)
-			}
-
-			got, err := fetchFromIMDS(&fetcher)
+			got, err := fetchFromIMDS(fetcher)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("expected error %v, got %v", tt.wantErr, err)
 			}
