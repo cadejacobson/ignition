@@ -18,14 +18,123 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
+	"github.com/coreos/ignition/v2/config/v3_7_experimental/types"
 	"github.com/coreos/ignition/v2/internal/log"
+	"github.com/coreos/ignition/v2/internal/resource"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestFetchFromIMDSRetryCodes(t *testing.T) {
+	config := `{"ignition":{"version":"3.4.0"}}`
+	encoded := base64.StdEncoding.EncodeToString([]byte(config))
+
+	tests := []struct {
+		name         string
+		status       int
+		wantAttempts int32
+		wantErr      error
+	}{
+		{
+			name:         "404 is retried",
+			status:       http.StatusNotFound,
+			wantAttempts: 3,
+		},
+		{
+			name:         "410 is retried",
+			status:       http.StatusGone,
+			wantAttempts: 3,
+		},
+		{
+			name:         "429 is retried",
+			status:       http.StatusTooManyRequests,
+			wantAttempts: 3,
+		},
+		{
+			name:         "400 is not retried",
+			status:       http.StatusBadRequest,
+			wantAttempts: 1,
+			wantErr:      resource.ErrFailed,
+		},
+		{
+			name:         "200 succeeds without retry",
+			status:       http.StatusOK,
+			wantAttempts: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("expected GET, got %q", r.Method)
+				}
+				if r.URL.Path != "/metadata/instance/compute/userData" {
+					t.Errorf("unexpected IMDS path %q", r.URL.Path)
+				}
+				if r.URL.RawQuery != "api-version=2021-01-01&format=text" {
+					t.Errorf("unexpected IMDS query %q", r.URL.RawQuery)
+				}
+				if r.Header.Get("Metadata") != "true" {
+					t.Errorf("expected Metadata: true, got %q", r.Header.Get("Metadata"))
+				}
+
+				attempt := attempts.Add(1)
+				// A later success makes an unintended retry observable too.
+				if attempt <= 2 && tt.status != http.StatusOK {
+					w.WriteHeader(tt.status)
+					return
+				}
+				if _, err := w.Write([]byte(encoded)); err != nil {
+					t.Errorf("writing IMDS response: %v", err)
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			serverURL, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// These subtests must stay serial since the endpoint is package-global.
+			originalURL := imdsUserdataURL
+			imdsUserdataURL.Scheme = serverURL.Scheme
+			imdsUserdataURL.Host = serverURL.Host
+			t.Cleanup(func() { imdsUserdataURL = originalURL })
+
+			logger := log.New(true)
+			fetcher := resource.Fetcher{Logger: &logger}
+			totalTimeout := 5
+			if err := fetcher.UpdateHttpTimeoutsAndCAs(types.Timeouts{
+				HTTPTotal: &totalTimeout,
+			}, nil, types.Proxy{}); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := fetchFromIMDS(&fetcher)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("expected error %v, got %v", tt.wantErr, err)
+			}
+			if gotAttempts := attempts.Load(); gotAttempts != tt.wantAttempts {
+				t.Fatalf("expected %d requests, got %d", tt.wantAttempts, gotAttempts)
+			}
+			if tt.wantErr == nil && string(got) != config {
+				t.Fatalf("expected decoded config %q, got %q", config, got)
+			}
+			if tt.wantErr != nil && len(got) != 0 {
+				t.Fatalf("expected no config on error, got %q", got)
+			}
+		})
+	}
+}
 
 // ovfEnvWithCustomData returns an Azure ovf-env.xml with the given CustomData
 // element (which may be empty) spliced into the provisioning section.
